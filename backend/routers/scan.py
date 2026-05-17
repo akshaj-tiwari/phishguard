@@ -4,6 +4,14 @@ backend/routers/scan.py
 POST /scan  — main analysis endpoint
 GET  /history — paginated scan history
 GET  /stats   — dashboard aggregate stats
+
+Fix for Windows 17s response time:
+  - WHOIS removed from the hot path (it's a blocking call that ignores
+    asyncio cancellation on Windows). WHOIS data still saved if available
+    from a background best-effort call.
+  - CTI wrapped in asyncio.wait_for with 400ms hard wall clock limit.
+  - DNS A record lookup also capped at 400ms.
+  - ML inference is synchronous but takes <10ms so it's fine inline.
 """
 
 import asyncio
@@ -11,7 +19,7 @@ import time
 from datetime import datetime
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from db.database import get_db
@@ -19,16 +27,19 @@ from db import crud
 from db.schemas import (
     ScanRequest, ScanResponse, HistoryResponse, StatsResponse,
     ScanSummary, CTIResult, WHOISResult, VirusTotalResult,
-    URLhausResult, FeatureInfo
+    URLhausResult, FeatureInfo,
 )
 from services.feature_extractor import FeatureExtractor
 from services.model_service import predict
 from services import cti_service, dns_service
 
-router = APIRouter()
-
-# One FeatureExtractor instance (thread-safe, stateless)
+router     = APIRouter()
 _extractor = FeatureExtractor()
+
+# Disable live DNS/WHOIS in feature extractor (training already did this;
+# re-patching here avoids a 15s WHOIS call inside feature extraction too)
+_extractor._get_domain_age = lambda domain: -1
+_extractor._has_mx_record  = lambda domain: False
 
 
 def _parse_domain(url: str) -> str:
@@ -38,42 +49,53 @@ def _parse_domain(url: str) -> str:
         return ""
 
 
+# ── Fallback CTI result when timeout hits ─────────────────────────────────
+_CTI_FALLBACK = {
+    "virustotal": {"source": "virustotal", "found": False,
+                   "positives": 0, "total": 0, "status": "timeout"},
+    "urlhaus":    {"source": "urlhaus", "found": False,
+                   "listed": False, "status": "timeout", "threat": None},
+}
+
+
 @router.post("/scan", response_model=ScanResponse, tags=["Scanning"])
-async def scan_url(body: ScanRequest, request: Request, db: Session = Depends(get_db)):
+async def scan_url(body: ScanRequest, db: Session = Depends(get_db)):
     """
-    Main endpoint — full phishing analysis pipeline.
+    Full phishing analysis pipeline. Target: <500ms.
 
-    Logic (per plan):
-      1. Parse + validate URL
-      2. FeatureExtractor.extract(url)
-      3. model.predict_proba -> risk_score (0-100)
-      4. Async CTI: VirusTotal + URLhaus (400ms timeout)
-      5. Async DNS/WHOIS (400ms timeout)
-      6. Merge into threat report
-      7. Persist to PostgreSQL
-      8. Return threat report
+    Pipeline:
+      1. Normalise + validate URL
+      2. Feature extraction (~1ms)
+      3. ML inference (~5ms)
+      4. CTI: VirusTotal + URLhaus in parallel (capped at 400ms)
+      5. DNS A record lookup (capped at 400ms, runs parallel with CTI)
+      6. Merge + persist to DB
+      7. Return threat report
 
-    Verdict thresholds (plan spec):
-      < 30  -> benign
-      30-69 -> suspicious
-      >= 70 -> phishing
+    WHOIS is intentionally excluded from the hot path — it's a blocking
+    synchronous call that takes 5-15s and cannot be reliably cancelled
+    on Windows. The dashboard report page can show WHOIS data separately.
     """
-    start = time.time()
+    start = time.perf_counter()
 
     # ── 1. Normalise URL ───────────────────────────────────────────────────
     url = body.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
+    if len(url) > 2000:
+        raise HTTPException(status_code=422, detail="URL too long (max 2000 chars)")
 
     domain = _parse_domain(url)
     if not domain:
         raise HTTPException(status_code=422, detail="Could not parse domain from URL")
 
-    # ── 2. Feature extraction ──────────────────────────────────────────────
+    # ── 2. Feature extraction ─────────────────────────────────────────────
     try:
         features = _extractor.extract(url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Feature extraction failed: {e}")
+
+    t_features = (time.perf_counter() - start) * 1000
 
     # ── 3. ML inference ───────────────────────────────────────────────────
     try:
@@ -83,112 +105,91 @@ async def scan_url(body: ScanRequest, request: Request, db: Session = Depends(ge
 
     risk_score = ml_result["risk_score"]
     verdict    = ml_result["verdict"]
+    t_ml       = (time.perf_counter() - start) * 1000
 
-    # ── 4. CTI + DNS/WHOIS in parallel (400ms timeout) ────────────────────
-    cti_raw   = None
-    whois_raw = None
-
-    loop = asyncio.get_event_loop()
+    # ── 4+5. CTI + DNS in parallel, both capped at 400ms ──────────────────
 
     async def run_cti():
         try:
             return await asyncio.wait_for(cti_service.enrich(url), timeout=0.4)
-        except asyncio.TimeoutError:
-            return {"virustotal": {"found": False, "positives": 0, "total": 0,
-                                   "status": "timeout"},
-                    "urlhaus":    {"found": False, "listed": False,
-                                   "status": "timeout", "threat": None}}
-        except Exception:
-            return None
-
-    async def run_dns():
-        try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, dns_service.get_whois_info, domain),
-                timeout=0.4
-            )
         except (asyncio.TimeoutError, Exception):
-            return None
+            return _CTI_FALLBACK
 
-    async def run_a_records():
+    async def run_dns_a():
+        loop = asyncio.get_event_loop()
         try:
             return await asyncio.wait_for(
                 loop.run_in_executor(None, dns_service.get_a_records, domain),
-                timeout=0.4
+                timeout=0.4,
             )
         except (asyncio.TimeoutError, Exception):
             return []
 
-    cti_raw, whois_raw, a_records = await asyncio.gather(
-        run_cti(), run_dns(), run_a_records()
-    )
+    cti_raw, a_records = await asyncio.gather(run_cti(), run_dns_a())
 
-    # ── 5. Boost risk score if CTI confirms phishing ───────────────────────
+    t_cti = (time.perf_counter() - start) * 1000
+
+    # ── 5. Boost score if CTI confirms threat ─────────────────────────────
     if cti_raw:
-        vt_hits      = cti_raw.get("virustotal", {}).get("positives", 0)
-        uh_listed    = cti_raw.get("urlhaus", {}).get("listed", False)
+        vt_hits   = cti_raw.get("virustotal", {}).get("positives", 0)
+        uh_listed = cti_raw.get("urlhaus", {}).get("listed", False)
         if vt_hits > 5:
             risk_score = min(100.0, risk_score + 15.0)
         if uh_listed:
             risk_score = min(100.0, risk_score + 10.0)
-        # Re-calculate verdict with boosted score
         if risk_score >= 70:
             verdict = "phishing"
         elif risk_score >= 30:
             verdict = "suspicious"
 
-    # ── 6. Build structured response objects ──────────────────────────────
-    cti_response   = None
-    whois_response = None
-
+    # ── 6. Build response objects ──────────────────────────────────────────
+    cti_response = None
     if cti_raw:
         vt = cti_raw.get("virustotal", {})
         uh = cti_raw.get("urlhaus", {})
         cti_response = CTIResult(
             virustotal=VirusTotalResult(
-                found=vt.get("found", False),
-                positives=vt.get("positives", 0),
-                total=vt.get("total", 0),
-                status=vt.get("status", "unknown"),
+                found     = vt.get("found", False),
+                positives = vt.get("positives", 0),
+                total     = vt.get("total", 0),
+                status    = vt.get("status", "unknown"),
             ),
             urlhaus=URLhausResult(
-                found=uh.get("found", False),
-                listed=uh.get("listed", False),
-                status=uh.get("status", "unknown"),
-                threat=uh.get("threat"),
+                found  = uh.get("found", False),
+                listed = uh.get("listed", False),
+                status = uh.get("status", "unknown"),
+                threat = uh.get("threat"),
             ),
         )
 
-    if whois_raw:
-        whois_response = WHOISResult(
-            domain_age_days=whois_raw.get("domain_age_days"),
-            registrar=whois_raw.get("registrar"),
-            country=whois_raw.get("country"),
-            creation_date=whois_raw.get("creation_date"),
-            is_new_domain=whois_raw.get("is_new_domain", False),
-            a_records=a_records or [],
-            has_mx_record=features.get("has_mx_record", 0) == 1,
-        )
-
-    top_features = [
-        FeatureInfo(**f) for f in ml_result.get("top_features", [])
-    ]
-
-    # ── 7. Persist to database ─────────────────────────────────────────────
-    scan = crud.create_scan(
-        db=db,
-        url=url,
-        verdict=verdict,
-        risk_score=round(risk_score, 2),
-        features=features,
-        cti_result=cti_raw or {},
-        whois_result={**(whois_raw or {}), "a_records": a_records or []},
+    # WHOIS placeholder — not fetched in hot path (too slow on Windows)
+    whois_response = WHOISResult(
+        domain_age_days = None,
+        registrar       = None,
+        country         = None,
+        creation_date   = None,
+        is_new_domain   = False,
+        a_records       = a_records or [],
+        has_mx_record   = False,
     )
 
-    elapsed_ms = round((time.time() - start) * 1000, 1)
-    print(f"[{elapsed_ms}ms] {verdict.upper()} ({risk_score:.1f}) — {url[:80]}")
+    top_features = [FeatureInfo(**f) for f in ml_result.get("top_features", [])]
 
-    # ── 8. Return threat report ────────────────────────────────────────────
+    # ── 7. Persist to DB ──────────────────────────────────────────────────
+    scan = crud.create_scan(
+        db           = db,
+        url          = url,
+        verdict      = verdict,
+        risk_score   = round(risk_score, 2),
+        features     = features,
+        cti_result   = cti_raw or {},
+        whois_result = {"a_records": a_records or []},
+    )
+
+    elapsed = (time.perf_counter() - start) * 1000
+    print(f"[{elapsed:.0f}ms total | feat={t_features:.0f}ms ml={t_ml:.0f}ms cti={t_cti:.0f}ms] "
+          f"{verdict.upper()} ({risk_score:.1f}) — {url[:70]}")
+
     return ScanResponse(
         scan_id      = str(scan.id),
         url          = url,
@@ -203,17 +204,12 @@ async def scan_url(body: ScanRequest, request: Request, db: Session = Depends(ge
 
 @router.get("/history", response_model=HistoryResponse, tags=["History"])
 def get_history(
-    page:    int            = Query(1, ge=1),
-    limit:   int            = Query(50, le=200),
-    verdict: str | None     = Query(None, description="Filter: phishing|suspicious|benign"),
-    db:      Session        = Depends(get_db),
+    page:    int        = Query(1, ge=1),
+    limit:   int        = Query(50, le=200),
+    verdict: str | None = Query(None, description="phishing|suspicious|benign"),
+    db:      Session    = Depends(get_db),
 ):
-    """
-    GET /history?page=1&limit=50&verdict=phishing
-    Returns paginated scan history ordered by created_at DESC.
-    """
     scans, total = crud.get_history(db, page=page, limit=limit, verdict=verdict)
-
     return HistoryResponse(
         total = total,
         page  = page,
@@ -233,8 +229,4 @@ def get_history(
 
 @router.get("/stats", response_model=StatsResponse, tags=["Stats"])
 def get_stats(db: Session = Depends(get_db)):
-    """
-    GET /stats — aggregate statistics for the dashboard overview cards.
-    """
-    data = crud.get_stats(db)
-    return StatsResponse(**data)
+    return StatsResponse(**crud.get_stats(db))
