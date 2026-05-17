@@ -1,14 +1,44 @@
 # Python
-venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+
+# Secrets — NEVER commit
 .env
+
+# ML model artifacts (large — regenerate locally, or use Git LFS)
+backend/models/*.pkl
+ml/models/*.pkl
+ml/data/*.csv
+ml/data/*.zip
+ml/plots/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# MLflow
+mlruns/
+
+# IDE
+.vscode/settings.json
+.idea/
 
 # Node
 node_modules/
-
-# VSCode
-.vscode/
+dashboard/dist/
+dashboard/build/
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Logs
+*.log
