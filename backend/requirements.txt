@@ -1,18 +1,35 @@
-fastapi
-uvicorn[standard]
-httpx
-python-whois
-dnspython
-xgboost
-scikit-learn
-pandas
-numpy
-joblib
-mlflow
-python-dotenv
-sqlalchemy
-psycopg2-binary
-python-Levenshtein
-pydantic
-tldextract
-matplotlib
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9     # for form data in CTI endpoints
+
+# ── HTTP client ────────────────────────────────────────────────────────────
+httpx>=0.27.0
+
+# ── ML stack ──────────────────────────────────────────────────────────────
+xgboost>=2.0.0
+lightgbm>=4.0.0
+scikit-learn>=1.4.0
+pandas>=2.0.0
+numpy>=1.26.0
+joblib>=1.3.0
+
+# ── NLP / URL analysis ────────────────────────────────────────────────────
+python-Levenshtein>=0.23.0
+tldextract>=5.1.0
+
+# ── WHOIS / DNS ────────────────────────────────────────────────────────────
+python-whois>=0.9.0
+dnspython>=2.6.0
+
+# ── Database ──────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0       # PostgreSQL driver (optional; SQLite works without it)
+
+# ── Validation + config ────────────────────────────────────────────────────
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+
+# ── MLflow experiment tracking (optional — remove if not needed) ──────────
+mlflow>=2.12.0
+matplotlib>=3.8.0
