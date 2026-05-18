@@ -129,7 +129,17 @@ h2 {
 /* Dynamic Classes */
 .safe .risk-score { color: var(--success); }
 .safe .risk-label { color: var(--success); }
+.safe { border-color: rgba(16, 185, 129, 0.3) !important; }
+
 .suspicious .risk-score { color: var(--warning); }
 .suspicious .risk-label { color: var(--warning); }
+.suspicious { border-color: rgba(245, 158, 11, 0.3) !important; }
+
 .malicious .risk-score { color: var(--danger); }
 .malicious .risk-label { color: var(--danger); }
+.malicious { border-color: rgba(239, 68, 68, 0.35) !important; background: rgba(239, 68, 68, 0.08) !important; }
+
+.loading .risk-score { color: var(--text-muted); }
+.loading .risk-label { color: var(--text-muted); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.loading { animation: pulse 1.5s ease-in-out infinite; }
