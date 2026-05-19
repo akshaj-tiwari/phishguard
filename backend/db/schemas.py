@@ -1,13 +1,11 @@
 """
 backend/db/schemas.py
 =======================
-Pydantic models for request validation and response serialization.
-Response shape matches the plan spec exactly.
+Pydantic v2 models for request validation and response serialization.
 """
 
 from pydantic import BaseModel, field_validator
 from typing import Optional, List, Any
-from datetime import datetime
 
 
 # ── Request ────────────────────────────────────────────────────────────────
@@ -32,7 +30,7 @@ class ScanRequest(BaseModel):
     }
 
 
-# ── Response pieces ────────────────────────────────────────────────────────
+# ── CTI Response pieces ────────────────────────────────────────────────────
 
 class VirusTotalResult(BaseModel):
     found:     bool
@@ -48,20 +46,35 @@ class URLhausResult(BaseModel):
     threat: Optional[str] = None
 
 
+class PhishTankResult(BaseModel):
+    found:           bool
+    verified:        bool  = False
+    phish_id:        Optional[str] = None
+    submission_time: Optional[str] = None
+    verified_at:     Optional[str] = None
+    target:          Optional[str] = None
+    status:          str           = "unknown"
+
+
 class CTIResult(BaseModel):
     virustotal: VirusTotalResult
     urlhaus:    URLhausResult
+    phishtank:  Optional[PhishTankResult] = None
 
+
+# ── WHOIS / DNS ────────────────────────────────────────────────────────────
 
 class WHOISResult(BaseModel):
     domain_age_days: Optional[int] = None
     registrar:       Optional[str] = None
     country:         Optional[str] = None
     creation_date:   Optional[str] = None
-    is_new_domain:   bool = False
-    a_records:       List[str] = []
-    has_mx_record:   bool = False
+    is_new_domain:   bool          = False
+    a_records:       List[str]     = []
+    has_mx_record:   bool          = False
 
+
+# ── Feature info ───────────────────────────────────────────────────────────
 
 class FeatureInfo(BaseModel):
     feature:      str
@@ -70,24 +83,20 @@ class FeatureInfo(BaseModel):
     contribution: float
 
 
-# ── Main scan response (plan spec shape) ──────────────────────────────────
+# ── Main scan response ─────────────────────────────────────────────────────
 
 class ScanResponse(BaseModel):
-    """
-    Matches the plan spec response body for POST /scan:
-      scan_id, url, verdict, risk_score, top_features, cti, whois, timestamp
-    """
     scan_id:      str
     url:          str
-    verdict:      str                       # benign | suspicious | phishing
-    risk_score:   float                     # 0.0–100.0
+    verdict:      str         # benign | suspicious | phishing
+    risk_score:   float       # 0.0–100.0
     top_features: List[FeatureInfo]
-    cti:          Optional[CTIResult] = None
+    cti:          Optional[CTIResult]   = None
     whois:        Optional[WHOISResult] = None
-    timestamp:    str                       # ISO8601
+    timestamp:    str                   # ISO8601
 
 
-# ── History / stats ────────────────────────────────────────────────────────
+# ── History / Stats ────────────────────────────────────────────────────────
 
 class ScanSummary(BaseModel):
     scan_id:    str
@@ -104,10 +113,22 @@ class HistoryResponse(BaseModel):
     scans:  List[ScanSummary]
 
 
+class HourlyBucket(BaseModel):
+    hour:      int
+    scans:     int
+    malicious: int
+
+
+class TopDomain(BaseModel):
+    domain: str
+    count:  int
+
+
 class StatsResponse(BaseModel):
-    total_scans:     int
-    phishing_count:  int
-    suspicious_count: int
-    benign_count:    int
-    avg_risk_score:  float
+    total_scans:         int
+    phishing_count:      int
+    suspicious_count:    int
+    benign_count:        int
+    avg_risk_score:      float
     top_flagged_domains: List[dict]
+    hourly_breakdown:    List[dict]  = []
