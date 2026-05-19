@@ -151,7 +151,7 @@ Accuracy : 96.84%   (target >= 95%)  ✓
 ```
 
 When training finishes, two files are saved to `backend/models/`:
-- `phishguard_v1.pkl` — the trained XGBoost pipeline
+- `phishguard_v3.1.pkl` — the trained XGBoost pipeline
 - `feature_names.pkl` — the 40-feature name list
 
 Go back to the project root before continuing:
@@ -176,7 +176,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 You should see:
 ```
 ✓ Database ready (SQLite dev): sqlite:///...phishguard_dev.db...
-✓ Model loaded: .../backend/models/phishguard_v1.pkl (40 features)
+✓ Model loaded: .../backend/models/phishguard_v3.1.pkl (40 features)
 ✓ PhishGuard API ready
 ✓ Docs: http://localhost:8000/docs
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
